@@ -38,6 +38,7 @@ def _extract_all_tables(
             for table in tables or []:
                 if table:
                     all_data.extend(table)
+            page.flush_cache()
     return all_data
 
 
@@ -49,6 +50,7 @@ def _extract_full_text(file_bytes: bytes, password: str | None) -> str:
             t = page.extract_text() or ""
             if t.strip():
                 chunks.append(t)
+            page.flush_cache()
     return "\n".join(chunks)
 
 

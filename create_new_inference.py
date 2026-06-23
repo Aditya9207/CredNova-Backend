@@ -1,14 +1,22 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from datetime import datetime
+"""
+DEPRECATED / ALTERNATE ENTRY POINT (BE-12)
+-------------------------------------------
+This file is an orphaned alternate FastAPI application and is NOT the production entry
+point. The canonical server is `app.py`. This file is kept for reference only.
+If you intend to run this, ensure it stays in sync with app.py's schemas.
+"""
+from fastapi import FastAPI  # pyrefly: ignore[missing-import]
+from fastapi.middleware.cors import CORSMiddleware  # pyrefly: ignore[missing-import]
+from pydantic import BaseModel  # pyrefly: ignore[missing-import]
+from datetime import datetime, timezone
+from typing import Optional
 import os
-import pymongo
-import joblib
-import pandas as pd
-import numpy as np
+import pymongo  # pyrefly: ignore[missing-import]
+import joblib  # pyrefly: ignore[missing-import]
+import pandas as pd  # pyrefly: ignore[missing-import]
+import numpy as np  # pyrefly: ignore[missing-import]
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # pyrefly: ignore[missing-import]
 load_dotenv()
 
 # Import your custom modules
@@ -31,7 +39,7 @@ try:
     try:
         inference = joblib.load("artifacts/new_inference_wrapper.pkl")
         print("New inference wrapper loaded successfully!")
-    except:
+    except Exception:  # BE-10: fix bare except
         # If new one doesn't exist, try to create it
         print("Creating new inference wrapper...")
         preprocessor = bundle["preprocessor"]
@@ -70,7 +78,7 @@ class OnboardRequest(BaseModel):
     user_type: str
     region: str
     sms_count: float
-    bill_on_time_ratio: float | None = None
+    bill_on_time_ratio: Optional[float] = None
     recharge_freq: float
     sim_tenure: float
     location_stability: float
@@ -79,6 +87,9 @@ class OnboardRequest(BaseModel):
     land_verified: int
     age_group: str
     loan_amount_requested: float
+    recharge_pattern: str       # BE-2: was missing
+    loan_category: str          # BE-2: was missing
+    psychometric_score: float   # BE-2: was missing
     consent: bool = True
 
 class InputData(BaseModel):
@@ -94,6 +105,9 @@ class InputData(BaseModel):
     land_verified: int
     age_group: str
     loan_amount_requested: float
+    recharge_pattern: str       # BE-2: was missing
+    loan_category: str          # BE-2: was missing
+    psychometric_score: float   # BE-2: was missing
 
 # -------------------- HELPERS --------------------
 TIER_BINS = [(0.00, 0.05, "A+"), (0.05, 0.10, "A"), (0.10, 0.20, "B"), (0.20, 0.35, "C"), (0.35, 1.00, "D")]
@@ -110,7 +124,7 @@ def create_or_update_profile(req: ProfileRequest):
             "occupation": req.occupation,
         },
         "has_profile": True,
-        "profile_updated_at": datetime.utcnow(),
+        "profile_updated_at": datetime.now(timezone.utc),  # BE-9
     }
     users_coll.update_one({"clerk_user_id": req.clerk_user_id}, {"$set": doc}, upsert=True)
     return {"status": "stored", "clerk_user_id": req.clerk_user_id}
@@ -129,8 +143,8 @@ def onboard(req: OnboardRequest):
         req.bill_on_time_ratio = 0.0
     doc = {
         "clerk_user_id": req.clerk_user_id,
-        "raw": req.dict(),
-        "created": datetime.utcnow(),
+        "raw": req.model_dump(),  # BE-7/8: was req.dict()
+        "created": datetime.now(timezone.utc),  # BE-9: was datetime.utcnow()
         "status": "received"
     }
     inserted_id = users_coll.insert_one(doc).inserted_id
@@ -142,7 +156,7 @@ def predict(data: InputData):
         return {"error": "Model not loaded"}
     
     try:
-        df = pd.DataFrame([data.dict()])
+        df = pd.DataFrame([data.model_dump()])  # BE-7/8: was data.dict()
         result = infer_user(df, inference, explainer, feature_names, top_k_shap=5)
         return result
     except Exception as e:

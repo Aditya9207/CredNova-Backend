@@ -111,7 +111,7 @@ def aggregate_spending_from_csv(csv_text: str) -> dict[str, Any]:
     if "debits" not in df.columns:
         df["debits"] = 0.0
     else:
-        df["debits"] = pd.to_numeric(df["debits"], errors="coerce").fillna(0.0)
+        df["debits"] = pd.to_numeric(df["debits"], errors="coerce").fillna(0.0)  # type: ignore
 
     spend = df[df["debits"] > 0].copy()
     if spend.empty:
@@ -121,7 +121,7 @@ def aggregate_spending_from_csv(csv_text: str) -> dict[str, Any]:
             "row_count": len(df),
         }
 
-    spend["category"] = spend["remarks"].astype(str).map(_classify_remark)
+    spend["category"] = spend["remarks"].astype(str).map(_classify_remark)  # type: ignore
     grouped = spend.groupby("category", sort=False)["debits"].sum()
     total = float(grouped.sum()) or 1.0
 

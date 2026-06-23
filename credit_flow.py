@@ -8,7 +8,7 @@ import io
 import logging
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
@@ -371,7 +371,7 @@ async def _run_credit_apply(
             "inspector_notes": "",
             "verified_at": None,
         },
-        "created": datetime.utcnow(),
+        "created": datetime.now(timezone.utc),
         "status": "scored",
         "bank_employee_csv": bool(statement_df is not None),
     }
@@ -637,9 +637,9 @@ async def admin_update_assets(
                     "home_assessed_value_inr": body.home_assessed_value_inr,
                     "gold_assessed_value_inr": body.gold_assessed_value_inr,
                     "inspector_notes": body.inspector_notes,
-                    "verified_at": datetime.utcnow(),
+                    "verified_at": datetime.now(timezone.utc),
                 },
-                "rescored_at": datetime.utcnow(),
+                "rescored_at": datetime.now(timezone.utc),
             }
         },
     )

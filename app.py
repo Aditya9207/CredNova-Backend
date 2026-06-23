@@ -1,7 +1,8 @@
+# pyrefly: ignore [missing-import]
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import os
 import pymongo
@@ -16,6 +17,7 @@ load_dotenv()
 
 # Custom modules
 from inference_utils import infer_user, pd_to_tier, aggregate_user_scores
+from models import InferenceModel
 from credit_flow import router as credit_router
 
 # MongoDB connection
@@ -37,7 +39,7 @@ def ollama_generate(prompt: str, model: str = "mistral"):
 
 
 # Load feature explanation KB //Retrerivel Layer
-with open("feature_explanations.json") as f:
+with open("feature_explanations.json", encoding="utf-8") as f:
     feature_kb = json.load(f)
 
 def retrieve_explanations(top_shap):
@@ -84,22 +86,11 @@ def ensure_consistent_output(result: dict) -> dict:
         "loan_approval_probability": result.get("loan_approval_probability") or (1 - result.get("pd", 0)),
     }
 
-class SimpleInference:
-    def __init__(self, preprocessor, calibrated_clf):
-        self.pre = preprocessor
-        self.clf = calibrated_clf
-    
-    def predict_proba(self, X):
-        X_enc = self.pre.transform(X)
-        return self.clf.predict_proba(X_enc)
-    
-    def predict(self, X, thr=0.5):
-        return (self.predict_proba(X)[:,1] >= thr).astype(int)
-
+# BE-3 fix: removed duplicate SimpleInference class; InferenceModel is now imported from models.py
 # Load model bundle
 try:
     bundle = joblib.load("artifacts/bharatscore_pipeline_bundle.pkl")
-    inference = SimpleInference(bundle["preprocessor"], bundle["calibrated_clf"])
+    inference = InferenceModel(bundle["preprocessor"], bundle["calibrated_clf"])
     explainer = bundle["explainer"]
     feature_names = bundle["feature_names"]
     print("Models loaded successfully!")
@@ -257,16 +248,7 @@ def generate_remark(application_data):
 
 
 
-# -------------------- OUPUT NORMALIZED FUNCION  --------------------
-def normalize_model_output(app):
-    """Extracts credit score, risk tier, and probability consistently from any application doc."""
-    model_output = app.get("model_output", app)  # sometimes it's nested, sometimes top-level
-
-    return {
-        "final_cibil_score": model_output.get("final_cibil_score"),
-        "final_tier": model_output.get("final_tier"),
-        "loan_approval_probability": model_output.get("loan_approval_probability"),
-    }
+# BE-13: normalize_model_output was defined but never called — removed dead code.
 
 # -------------------- ENDPOINTS --------------------
 
@@ -282,7 +264,7 @@ def create_or_update_profile(req: ProfileRequest):
             "occupation": req.occupation,
         },
         "has_profile": True,
-        "profile_updated_at": datetime.utcnow(),
+        "profile_updated_at": datetime.now(timezone.utc),
     }
     users_coll.update_one({"clerk_user_id": req.clerk_user_id}, {"$set": doc}, upsert=True)
     return {"status": "stored", "clerk_user_id": req.clerk_user_id}
@@ -302,8 +284,8 @@ def onboard(req: OnboardRequest):
         req.bill_on_time_ratio = 0.0
     doc = {
         "clerk_user_id": req.clerk_user_id,
-        "raw": req.dict(),
-        "created": datetime.utcnow(),
+        "raw": req.model_dump(),
+        "created": datetime.now(timezone.utc),
         "status": "received"
     }
     inserted_id = users_coll.insert_one(doc).inserted_id
@@ -315,7 +297,7 @@ def predict(data: InputData):
     if inference is None:
         return {"error": "Model not loaded"}
     try:
-        df = pd.DataFrame([data.dict()])
+        df = pd.DataFrame([data.model_dump()])
         result = infer_user(df, inference, explainer, feature_names, top_k_shap=5)
         result = ensure_consistent_output(result)
         return result
@@ -345,11 +327,7 @@ def save_psychometric_score(req: PsychometricScoreRequest):
     if score < 0 or score > 1:
         raise HTTPException(status_code=400, detail="Score must be between 0 and 1")
     
-    user = users_coll.find_one({"clerk_user_id": req.clerk_user_id})
-    now = datetime.utcnow()
-    
-    # OPTION 1: Remove all restrictions - users can take test anytime
-    # Simply save the score without any time checks
+    now = datetime.now(timezone.utc)
     users_coll.update_one(
         {"clerk_user_id": req.clerk_user_id},
         {"$set": {"psychometric_score": score, "psychometric_taken_at": now}},
@@ -433,7 +411,7 @@ def admin_applications_summary():
     counts = list(users_coll.aggregate(pipeline))
 
     total = sum([c["count"] for c in counts])
-    summary = {"total_applications": total, "pending": 0, "approved": 0, "issues": 0}
+    summary: dict = {"total_applications": total, "pending": 0, "approved": 0, "issues": 0}
 
     for c in counts:
         if c["_id"] in ["received", "pending"]:
@@ -487,14 +465,16 @@ def admin_application_detail(clerk_user_id: str):
             try:
                 df = pd.DataFrame([raw_data])
                 model_result = infer_user(df, inference, explainer, feature_names, top_k_shap=5)
-                # Save the model output
+                model_result = ensure_consistent_output(model_result)
+                # Save the normalized model output
                 users_coll.update_one(
                     {"_id": app["_id"]},
                     {"$set": {"model_output": model_result}}
                 )
             except Exception as e:
                 model_result = {"error": str(e)}
-                
+        else:
+            # BE-5 fix: also normalize existing DB records so field names are consistent
             model_result = ensure_consistent_output(model_result)
 
         applications.append({
@@ -540,11 +520,12 @@ def update_application_status(clerk_user_id: str, created_timestamp: str, update
         )
 
     # Prepare update document
+    _now = datetime.now(timezone.utc)
     update_doc = {
         "status": update_req.status,
         "admin_remarks": update_req.remarks,
         "admin_notes": update_req.admin_notes,
-        "status_updated_at": datetime.utcnow(),
+        "status_updated_at": _now,
         "status_updated_by": "admin"
     }
     
@@ -558,7 +539,7 @@ def update_application_status(clerk_user_id: str, created_timestamp: str, update
     
     update_doc["user_notification"] = {
         "message": status_messages.get(update_req.status, "Your application status has been updated."),
-        "timestamp": datetime.utcnow(),
+        "timestamp": _now,
         "read": False
     }
 
@@ -656,11 +637,12 @@ async def generate_ai_insight(req: AIInsightRequest):
             insight += "HIGH RISK - Requires careful manual assessment"
     
     # Store the insight in database
+    _now = datetime.now(timezone.utc)
     users_coll.update_one(
         {"clerk_user_id": req.clerk_user_id, "created": req.application_created},
         {"$set": {
             "ai_insight": insight,
-            "ai_insight_generated_at": datetime.utcnow(),
+            "ai_insight_generated_at": _now,
             "model_output": model_result
         }}
     )
@@ -668,42 +650,22 @@ async def generate_ai_insight(req: AIInsightRequest):
     return {
         "insight": insight,
         "model_output": model_result,
-        "generated_at": datetime.utcnow()
+        "generated_at": _now
     }
 
 # User notification endpoints
-@app.get("/user/notifications")
-def get_user_notifications(clerk_user_id: str):
-    """Get all notifications for a user"""
-    
-    applications = list(users_coll.find(
-        {"clerk_user_id": clerk_user_id, "user_notification": {"$exists": True}},
-        {"_id": 0, "user_notification": 1, "status": 1, "created": 1, "admin_remarks": 1}
-    ).sort("created", -1))
-    
-    notifications = []
-    for app in applications:
-        if "user_notification" in app:
-            notifications.append({
-                "message": app["user_notification"]["message"],
-                "timestamp": app["user_notification"]["timestamp"],
-                "read": app["user_notification"].get("read", False),
-                "status": app["status"],
-                "application_date": app["created"],
-                "admin_remarks": app.get("admin_remarks", "")
-            })
-    
-    return {"notifications": notifications}
+# BE-14: removed duplicate /user/notifications (simple) endpoint; use /user/notifications/{clerk_user_id} instead.
+
+class MarkReadRequest(BaseModel):
+    clerk_user_id: str
 
 @app.post("/user/notifications/mark-read")
-def mark_notifications_read(clerk_user_id: str):
-    """Mark all notifications as read for a user"""
-    
+def mark_notifications_read(body: MarkReadRequest):
+    """Mark all notifications as read for a user. Accepts JSON body: {clerk_user_id: str}"""
     users_coll.update_many(
-        {"clerk_user_id": clerk_user_id, "user_notification.read": False},
+        {"clerk_user_id": body.clerk_user_id, "user_notification.read": False},
         {"$set": {"user_notification.read": True}}
     )
-    
     return {"message": "All notifications marked as read"}
 
 @app.get("/user/notifications/{clerk_user_id}")
@@ -758,7 +720,7 @@ def get_unread_notification_count(clerk_user_id: str):
     return {"unread_count": count}
 
 @app.patch("/user/notifications/{clerk_user_id}/mark-read")
-def mark_specific_notification_read(clerk_user_id: str, notification_id: str = None):
+def mark_specific_notification_read(clerk_user_id: str, notification_id: Optional[str] = None):
     """Mark specific notification as read"""
     
     if notification_id:
@@ -829,8 +791,11 @@ def get_user_applications_with_notifications(clerk_user_id: str):
 
 @app.post("/generate-remark")
 def generate_remark_endpoint(data: InputData):
+    # BE-1 fix: null-guard for model not loaded
+    if inference is None:
+        raise HTTPException(status_code=500, detail="Model not loaded")
     # Convert incoming JSON to DataFrame
-    df = pd.DataFrame([data.dict()])
+    df = pd.DataFrame([data.model_dump()])
 
     # Run model inference + SHAP explanation
     result = infer_user(df, inference, explainer, feature_names, top_k_shap=5)

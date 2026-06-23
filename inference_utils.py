@@ -95,7 +95,17 @@ def aggregate_user_scores(loans):
         }
     
     total_weight = sum(l.get("loan_amount_requested", 1) for l in loans)
-    weighted_score = sum(l["alt_cibil_score"] * l.get("loan_amount_requested", 1) for l in loans) / total_weight
+    weighted_score = sum(
+        (l.get("alt_cibil_score") or l.get("final_cibil_score", 0)) * l.get("loan_amount_requested", 1)
+        for l in loans
+    ) / total_weight
+
+    # Compute weighted average approval probability (BE-4 fix)
+    weighted_prob = sum(
+        (l.get("loan_approval_probability") or (1 - l.get("pd", 0.5)))
+        * l.get("loan_amount_requested", 1)
+        for l in loans
+    ) / total_weight
 
     # Map aggregated score back into tier
     if weighted_score >= 750:
@@ -112,5 +122,6 @@ def aggregate_user_scores(loans):
     return {
         "final_cibil_score": round(weighted_score, 2),
         "final_tier": final_tier,
-        "loan_count": len(loans)
+        "loan_count": len(loans),
+        "loan_approval_probability": round(float(weighted_prob), 4),
     }

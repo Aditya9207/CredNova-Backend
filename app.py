@@ -104,6 +104,7 @@ except Exception as e:
 app = FastAPI(title="CredNova API", version="2.0")
 
 # CORS
+_extra_origins = [o.strip() for o in os.getenv("EXTRA_CORS_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -113,8 +114,11 @@ app.add_middleware(
         "http://127.0.0.1:5174",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        "https://cred-nova-frontend.vercel.app"
+        "https://cred-nova-frontend.vercel.app",
+        *_extra_origins,
     ],
+    # Covers all *.vercel.app preview/branch URLs automatically
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

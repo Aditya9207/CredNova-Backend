@@ -286,8 +286,8 @@ async def _run_credit_apply(
     elif statement_pdf is not None and getattr(statement_pdf, "filename", None):
         raw = await statement_pdf.read()
         logger.info("Step 2/8: PDF uploaded size_bytes=%s", len(raw))
-        if len(raw) > 15 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="PDF too large (max 15MB)")
+        if len(raw) > 5 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="PDF too large (max 5MB to prevent memory limits)")
         df, parse_message, statement_metrics = process_bank_pdf(raw, pdf_password or None)
         if df is None:
             if parse_message == "PASSWORD_REQUIRED":

@@ -26,11 +26,15 @@ import pdfplumber
 def _extract_all_tables(
     file_bytes: bytes, password: str | None, table_settings: dict | None = None
 ) -> list:
-    """Collect table rows from every page; reset buffer each call."""
+    """Collect table rows from every page; reset buffer each call. Limited to 25 pages to prevent OOM."""
     bio = io.BytesIO(file_bytes)
     all_data: list = []
+    import gc
     with pdfplumber.open(bio, password=password or None) as pdf:
-        for page in pdf.pages:
+        for i, page in enumerate(pdf.pages):
+            if i >= 25:
+                _stmt_log.warning("PDF: max page limit (25) reached, truncating to prevent OOM.")
+                break
             if table_settings:
                 tables = page.extract_tables(table_settings=table_settings)
             else:
@@ -39,18 +43,25 @@ def _extract_all_tables(
                 if table:
                     all_data.extend(table)
             page.flush_cache()
+            # aggressive GC
+            gc.collect()
     return all_data
 
 
 def _extract_full_text(file_bytes: bytes, password: str | None) -> str:
     bio = io.BytesIO(file_bytes)
     chunks: list[str] = []
+    import gc
     with pdfplumber.open(bio, password=password or None) as pdf:
-        for page in pdf.pages:
+        for i, page in enumerate(pdf.pages):
+            if i >= 25:
+                _stmt_log.warning("PDF: max page limit (25) reached for text extract, truncating.")
+                break
             t = page.extract_text() or ""
             if t.strip():
                 chunks.append(t)
             page.flush_cache()
+            gc.collect()
     return "\n".join(chunks)
 
 

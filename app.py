@@ -115,6 +115,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "https://cred-nova-frontend.vercel.app",
+        "https://crednova-backend.onrender.com",
         *_extra_origins,
     ],
     # Covers all *.vercel.app preview/branch URLs automatically

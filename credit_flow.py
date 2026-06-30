@@ -11,7 +11,6 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import httpx
 import pandas as pd
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -41,9 +40,8 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-CREDIT_MODEL_URL = os.getenv(
-    "CREDIT_MODEL_URL", "https://credit-scoring-model-7q1s.onrender.com/predict"
-)
+
+
 ADMIN_API_KEY = os.getenv("CREDIT_ADMIN_API_KEY", "")
 
 
@@ -186,65 +184,62 @@ def build_model_payload(form: CreditApplyForm, statement: dict[str, Any]) -> dic
     if cash is None:
         cash = statement.get("cash_transaction_ratio", 0.0)
 
-    upi_int = _int_upi_monthly(upi)
+    upi_val = float(_int_upi_monthly(upi))
+    cash_val = float(cash)
 
-    # External model expects a scalar; use range floor as thin-file proxy when undeclared
-    cibil_for_model = (
-        300
-        if (form.no_cibil_score or form.CIBIL_score is None)
-        else int(form.CIBIL_score)
-    )
+    cibil = 300 if (form.no_cibil_score or form.CIBIL_score is None) else int(form.CIBIL_score)
+    age = int(form.age)
+    income = float(form.annual_income)
+    existing_loans = int(form.existing_loans)
+    late_payments = int(form.late_payments)
+    utilization = float(form.credit_utilization)
+    vintage = float(form.business_vintage_years)
+
+    # assets: combined collateral flag
+    assets = float(form.has_home + form.has_gold)
+
+    # business_type encoding
+    type_map = {"salaried": 0, "self_employed": 1, "business": 2, "farmer": 3, "professional": 4}
+    business_type_encoded = float(type_map.get(normalize_business_type(form.business_type), 1))
+
+    # engineered features
+    loan_to_income = (existing_loans * 50000) / income if income > 0 else 0.0
+    risk_index = (utilization * 0.4) + (late_payments * 0.3) + (loan_to_income * 0.3)
+    digital_velocity = upi_val / 30.0
+    stability_index = min(vintage / 10.0, 1.0) * (1 - utilization)
+    alt_trust_score = (upi_val * 0.4) + ((1 - cash_val) * 0.3) + (stability_index * 0.3)
+    utilization_risk = utilization * (1 + late_payments * 0.1)
+    income_per_age = income / age if age > 0 else 0.0
+    digital_footprint_density = min(upi_val / 100.0, 1.0)
+    asset_leverage = assets / (existing_loans + 1)
+
     return {
-        "CIBIL_score": cibil_for_model,
-        "age": int(form.age),
-        "existing_loans": int(form.existing_loans),
-        "late_payments": int(form.late_payments),
-        "credit_utilization": float(form.credit_utilization),
-        "annual_income": float(form.annual_income),
-        "upi_transactions_monthly": upi_int,
-        "cash_transaction_ratio": float(cash),
-        "business_vintage_years": float(form.business_vintage_years),
-        "has_home": int(form.has_home),
-        "has_gold": int(form.has_gold),
-        "business_type": normalize_business_type(form.business_type),
+        "CIBIL_score": cibil,
+        "age": age,
+        "existing_loans": existing_loans,
+        "late_payments": late_payments,
+        "credit_utilization": utilization,
+        "annual_income": income,
+        "upi_transactions_monthly": upi_val,
+        "cash_transaction_ratio": cash_val,
+        "business_vintage_years": vintage,
+        "assets": assets,
+        "business_type_encoded": business_type_encoded,
+        "risk_index": round(risk_index, 6),
+        "loan_to_income": round(loan_to_income, 6),
+        "digital_velocity": round(digital_velocity, 6),
+        "stability_index": round(stability_index, 6),
+        "alt_trust_score": round(alt_trust_score, 6),
+        "utilization_risk": round(utilization_risk, 6),
+        "income_per_age": round(income_per_age, 6),
+        "digital_footprint_density": round(digital_footprint_density, 6),
+        "asset_leverage": round(asset_leverage, 6),
     }
 
-
 async def call_credit_model(payload: dict[str, Any]) -> dict[str, Any]:
-    # Render cold starts can exceed 60s; remote schema expects ints for some fields (see build_model_payload).
-    timeout = httpx.Timeout(120.0, connect=30.0)
-    logger.info(
-        "Step 5/8: Sending payload to online ML model (POST %s) upi_transactions_monthly=%s",
-        CREDIT_MODEL_URL,
-        payload.get("upi_transactions_monthly"),
-    )
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(CREDIT_MODEL_URL, json=payload)
-    except httpx.ReadTimeout as e:
-        logger.exception("Credit model HTTP read timeout (try again; Render may be cold)")
-        raise HTTPException(
-            status_code=504,
-            detail="Credit model service timed out. Wait a minute and retry (remote service may be waking up).",
-        ) from e
-    except httpx.RequestError as e:
-        logger.exception("Credit model request failed: %s", e)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not reach credit model service: {e!s}",
-        ) from e
-    if r.status_code != 200:
-        logger.error(
-            "Credit model HTTP %s: %s",
-            r.status_code,
-            (r.text or "")[:800],
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Credit model error {r.status_code}: {r.text[:500]}",
-        )
-    logger.info("Step 5/8: HTTP 200 — response body received from online ML model; parsing JSON")
-    return r.json()
+    from ml_inference import run_inference
+    result = run_inference(payload)
+    return result
 
 
 async def _run_credit_apply(

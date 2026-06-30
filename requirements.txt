@@ -36,3 +36,4 @@ motor
 python-dotenv
 httpx
 pdfplumber
+xgboost

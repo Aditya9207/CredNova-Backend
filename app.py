@@ -6,7 +6,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 import os
 import pymongo
-import joblib
 import pandas as pd
 from urllib.parse import unquote
 import subprocess
@@ -16,8 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Custom modules
-from inference_utils import infer_user, pd_to_tier, aggregate_user_scores
-from models import InferenceModel
+from inference_utils import pd_to_tier, aggregate_user_scores
 from credit_flow import router as credit_router
 
 # MongoDB connection
@@ -75,31 +73,6 @@ def retrieve_explanations(top_shap):
 #     return explanations
 
 
-# Simple inference class
-
-def ensure_consistent_output(result: dict) -> dict:
-    """Ensure credit score, tier, and probability are always available at top-level"""
-    return {
-        **result,  # keep everything else
-        "final_cibil_score": result.get("final_cibil_score") or result.get("alt_cibil_score"),
-        "final_tier": result.get("final_tier") or result.get("tier"),
-        "loan_approval_probability": result.get("loan_approval_probability") or (1 - result.get("pd", 0)),
-    }
-
-# BE-3 fix: removed duplicate SimpleInference class; InferenceModel is now imported from models.py
-# Load model bundle
-try:
-    bundle = joblib.load("artifacts/bharatscore_pipeline_bundle.pkl")
-    inference = InferenceModel(bundle["preprocessor"], bundle["calibrated_clf"])
-    explainer = bundle["explainer"]
-    feature_names = bundle["feature_names"]
-    print("Models loaded successfully!")
-except Exception as e:
-    print(f"Error loading models: {e}")
-    import traceback
-    traceback.print_exc()
-    bundle = inference = explainer = feature_names = None
-
 # FastAPI app
 app = FastAPI(title="CredNova API", version="2.0")
 
@@ -153,23 +126,6 @@ class OnboardRequest(BaseModel):
     loan_category: str
     psychometric_score: float
     consent: bool = True
-
-class InputData(BaseModel):
-    user_type: str
-    region: str
-    sms_count: float
-    bill_on_time_ratio: float
-    recharge_freq: float
-    sim_tenure: float
-    location_stability: float
-    income_signal: float
-    coop_score: float
-    land_verified: int
-    age_group: str
-    loan_amount_requested: float
-    recharge_pattern: str
-    loan_category: str
-    psychometric_score: float
 
 class PsychometricScoreRequest(BaseModel):
     clerk_user_id: str
@@ -297,34 +253,6 @@ def onboard(req: OnboardRequest):
     inserted_id = users_coll.insert_one(doc).inserted_id
     return {"mongo_id": str(inserted_id), "clerk_user_id": req.clerk_user_id, "status": "stored"}
 
-# Prediction endpoints
-@app.post("/predict")
-def predict(data: InputData):
-    if inference is None:
-        return {"error": "Model not loaded"}
-    try:
-        df = pd.DataFrame([data.model_dump()])
-        result = infer_user(df, inference, explainer, feature_names, top_k_shap=5)
-        result = ensure_consistent_output(result)
-        return result
-    except Exception as e:
-        import traceback
-        return {"error": str(e), "details": traceback.format_exc()}
-
-@app.get("/predict/{user_id}")
-def predict_existing_user(user_id: str):
-    from bson import ObjectId
-    if inference is None:
-        return {"error": "Model not loaded"}
-    user = users_coll.find_one({"_id": ObjectId(user_id)})
-    if not user:
-        return {"error": "User not found"}
-    raw_data = user["raw"]
-    df = pd.DataFrame([raw_data])
-    result = infer_user(df, inference, explainer, feature_names, top_k_shap=5)
-    users_coll.update_one({"_id": ObjectId(user_id)}, {"$set": {"prediction": result, "status": "predicted"}})
-    return result
-
 # Psychometric endpoints
 
 @app.post("/save-psychometric")
@@ -380,9 +308,13 @@ def get_user_data(clerk_user_id: str):
             print(f"Skipping app due to missing fields: {raw_data}")
             continue
 
-        df = pd.DataFrame([raw_data])
-        result = infer_user(df, inference, explainer, feature_names, top_k_shap=5)
-        result = ensure_consistent_output(result)
+        # Use new unified ML model (run_inference) — old BharatScore helpers removed
+        try:
+            from ml_inference import run_inference
+            result = run_inference(raw_data)
+        except Exception as e:
+            print(f"run_inference failed: {e}")
+            result = {"error": str(e)}
 
         # Add extra metadata
         result["loan_amount_requested"] = raw_data.get("loan_amount_requested", 0)
@@ -396,7 +328,7 @@ def get_user_data(clerk_user_id: str):
     aggregated = aggregate_user_scores(loan_results)
 
     return {
-        "applications": loan_results, 
+        "applications": loan_results,
         "final_cibil_score": aggregated["final_cibil_score"],
         "final_tier": aggregated["final_tier"],
         "loan_count": aggregated["loan_count"],
@@ -465,23 +397,19 @@ def admin_application_detail(clerk_user_id: str):
         if not raw_data:
             continue
 
-        # Get existing model output or generate new one
+        # Get existing model output or generate new one via unified ML model
         model_result = app.get("model_output")
         if not model_result:
             try:
-                df = pd.DataFrame([raw_data])
-                model_result = infer_user(df, inference, explainer, feature_names, top_k_shap=5)
-                model_result = ensure_consistent_output(model_result)
-                # Save the normalized model output
+                from ml_inference import run_inference
+                model_result = run_inference(raw_data)
+                # Save the computed model output for future reads
                 users_coll.update_one(
                     {"_id": app["_id"]},
                     {"$set": {"model_output": model_result}}
                 )
             except Exception as e:
                 model_result = {"error": str(e)}
-        else:
-            # BE-5 fix: also normalize existing DB records so field names are consistent
-            model_result = ensure_consistent_output(model_result)
 
         applications.append({
             "raw": raw_data,
@@ -584,10 +512,10 @@ async def generate_ai_insight(req: AIInsightRequest):
     if not raw_data:
         raise HTTPException(status_code=400, detail="No application data found")
     
-    # Generate model prediction if not exists
+    # Generate model prediction using unified ML model
     try:
-        df = pd.DataFrame([raw_data])
-        model_result = infer_user(df, inference, explainer, feature_names, top_k_shap=5)
+        from ml_inference import run_inference
+        model_result = run_inference(raw_data)
     except Exception as e:
         return {"error": f"Model prediction failed: {str(e)}"}
     
@@ -796,28 +724,23 @@ def get_user_applications_with_notifications(clerk_user_id: str):
 #         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/generate-remark")
-def generate_remark_endpoint(data: InputData):
-    # BE-1 fix: null-guard for model not loaded
-    if inference is None:
-        raise HTTPException(status_code=500, detail="Model not loaded")
-    # Convert incoming JSON to DataFrame
-    df = pd.DataFrame([data.model_dump()])
-
-    # Run model inference + SHAP explanation
-    result = infer_user(df, inference, explainer, feature_names, top_k_shap=5)
-
-    # Generate AI remark using Ollama + retrieved explanations
-    remark = generate_remark(result)
-    result["ai_remark"] = remark
-
-    return result
+def generate_remark_endpoint(data: dict):
+    from ml_inference import run_inference
+    try:
+        result = run_inference(data)
+        remark = generate_remark(result)
+        result["ai_remark"] = remark
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
 # Health check
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "models_loaded": inference is not None, "explainer_loaded": explainer is not None}
+    from ml_inference import model, scaler
+    return {"status": "healthy", "model_loaded": model is not None, "scaler_loaded": scaler is not None}
 
 @app.get("/")
 def root():

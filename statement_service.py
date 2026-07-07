@@ -771,7 +771,7 @@ def calculate_statement_metrics(df: pd.DataFrame) -> dict[str, Any]:
     elif "remarks" in clean_df.columns and total_txns > 0:
         ser = clean_df["remarks"].astype(str)
         cash_like = ser.str.contains(
-            r"atm|cash\s*wdl|cash\s*withdraw|cwdr|cash\s*dep", case=False, na=False
+            r"\bcash\b|atm|cwdr|withdraw", case=False, na=False
         )
         cash_ratio = round(float(cash_like.sum()) / total_txns, 4)
     else:

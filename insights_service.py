@@ -18,6 +18,10 @@ from typing import Any, Optional
 import httpx
 import pandas as pd
 
+from system_logger import get_logger
+
+logger = get_logger("insights")
+
 OPENAI_MODEL = os.getenv("OPENAI_INSIGHTS_MODEL", "gpt-4o-mini")
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
@@ -100,6 +104,7 @@ def _classify_remark(remark: str) -> str:
 def aggregate_spending_from_csv(csv_text: str) -> dict[str, Any]:
     """Sum debit amounts by spending category from exported statement CSV."""
     if not csv_text or len(csv_text.strip()) < 10:
+        logger.info("Spending aggregation skipped — empty or missing CSV")
         return {"categories": [], "total_debit_inr": 0.0, "row_count": 0}
 
     df = pd.read_csv(io.StringIO(csv_text))
@@ -136,6 +141,13 @@ def aggregate_spending_from_csv(csv_text: str) -> dict[str, Any]:
             }
         )
     cats.sort(key=lambda x: x["debits_inr"], reverse=True)
+
+    logger.info(
+        "Spending aggregated — rows=%s categories=%s total_debit_inr=%s",
+        len(df),
+        len(cats),
+        round(float(grouped.sum()), 2),
+    )
 
     return {
         "categories": cats,
@@ -337,7 +349,10 @@ async def llm_spending_and_credit_advice(
     Uses aggregated JSON only — not raw transaction rows (privacy + cost).
     """
     if not _openai_key():
+        logger.info("LLM insights skipped — OPENAI_API_KEY not set; using rule-based tips")
         return None, None, False
+
+    logger.info("LLM insights request — model=%s categories=%s", OPENAI_MODEL, len(aggregates.get("categories") or []))
 
     payload = {
         "spending": aggregates,
@@ -391,6 +406,7 @@ async def llm_spending_and_credit_advice(
                 },
             )
         if r.status_code != 200:
+            logger.warning("LLM insights failed — HTTP %s", r.status_code)
             return None, None, False
         data = r.json()
         txt = data["choices"][0]["message"]["content"]
@@ -398,12 +414,14 @@ async def llm_spending_and_credit_advice(
         narrative = parsed.get("spending_narrative")
         tips_raw = parsed.get("credit_tips")
         tips = [str(t) for t in tips_raw] if isinstance(tips_raw, list) else None
+        logger.info("LLM insights success — tips=%s narrative_len=%s", len(tips or []), len(narrative or ""))
         return (
             narrative if isinstance(narrative, str) else None,
             tips,
             True,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("LLM insights error: %s", exc)
         return None, None, False
 
 

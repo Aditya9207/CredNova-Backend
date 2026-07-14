@@ -37,3 +37,5 @@ python-dotenv
 httpx
 pdfplumber
 xgboost
+python-doctr[torch]
+opencv-python-headless

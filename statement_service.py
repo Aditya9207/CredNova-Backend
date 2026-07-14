@@ -6,21 +6,16 @@ to avoid heavy optional deps (transformers/spacy) from the Streamlit stack.
 from __future__ import annotations
 
 import io
-import logging
 import re
 from typing import Any, Optional, Tuple
-
-_stmt_log = logging.getLogger("crednova.statement")
-if not _stmt_log.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("%(levelname)s [statement] %(message)s"))
-    _stmt_log.addHandler(_h)
-    _stmt_log.setLevel(logging.INFO)
-    _stmt_log.propagate = False
 
 import numpy as np
 import pandas as pd
 import pdfplumber
+
+from system_logger import get_logger
+
+_stmt_log = get_logger("statement")
 
 
 def _extract_all_tables(
@@ -71,7 +66,9 @@ def fallback_dataframe_from_statement_text(text: str) -> Tuple[Optional[pd.DataF
     using regular expressions. This handles HDFC and SBI statements where pdfplumber table
     extraction fails or smashes rows together.
     """
+    _stmt_log.info("fallback_dataframe_from_statement_text: Starting text-based regex parsing...")
     if not text:
+        _stmt_log.warning("fallback_dataframe_from_statement_text: Input text is empty.")
         return None, "No text found in PDF"
 
     rows = []
@@ -81,7 +78,8 @@ def fallback_dataframe_from_statement_text(text: str) -> Tuple[Optional[pd.DataF
     amt_regex = re.compile(r"([\d,]+\.\d{2})\s*(?:Cr|Dr|CR|DR|cr|dr)?", re.I)
 
     lines = text.split("\n")
-    for line in lines:
+    _stmt_log.info("fallback_dataframe_from_statement_text: Processing %s lines of text...", len(lines))
+    for line_idx, line in enumerate(lines):
         line = line.strip()
         if not line:
             continue
@@ -105,11 +103,8 @@ def fallback_dataframe_from_statement_text(text: str) -> Tuple[Optional[pd.DataF
                 pass
 
         if len(amounts) >= 2:
-            # Typically: [...amounts, withdrawal/deposit, balance]
             bal = amounts[-1]
             amt = amounts[-2]
-            
-            # Clean the remark by removing date and amounts
             remarks = line[date_match.end():].strip()
             remarks = amt_regex.sub("", remarks).strip()
 
@@ -127,15 +122,17 @@ def fallback_dataframe_from_statement_text(text: str) -> Tuple[Optional[pd.DataF
                 "balance": 0.0
             })
 
+    _stmt_log.info("fallback_dataframe_from_statement_text: Extracted %s candidate rows from text.", len(rows))
     if not rows:
+        _stmt_log.warning("fallback_dataframe_from_statement_text: Found no transaction lines.")
         return None, "Text fallback failed to find any transactions"
 
-    # Now assign debits vs credits using running balance logic
+    _stmt_log.info("fallback_dataframe_from_statement_text: Resolving debits and credits using running balance heuristics...")
     debits = []
     credits = []
     prev_bal = None
 
-    for r in rows:
+    for idx, r in enumerate(rows):
         amt = r["amt"]
         bal = r["balance"]
         if prev_bal is not None and bal > 0:
@@ -162,15 +159,19 @@ def fallback_dataframe_from_statement_text(text: str) -> Tuple[Optional[pd.DataF
     df["credits"] = credits
     df.drop(columns=["amt"], inplace=True)
     
+    _stmt_log.info("fallback_dataframe_from_statement_text: Parsing finished. DataFrame columns: %s, shape: %s", 
+                   list(df.columns), df.shape)
     return df, "Text fallback (regex line-by-line extraction successful)"
 
 
 def detect_and_parse_pdf(file_bytes: bytes, password: str | None = None) -> Tuple[Optional[pd.DataFrame], str]:
+    _stmt_log.info("detect_and_parse_pdf: Starting parser execution...")
     try:
+        _stmt_log.info("detect_and_parse_pdf: Attempting table extraction with default settings...")
         all_data = _extract_all_tables(file_bytes, password, None)
 
         if not all_data:
-            _stmt_log.info("PDF: no tables with default settings — trying relaxed table strategies")
+            _stmt_log.info("detect_and_parse_pdf: No tables extracted with default settings — trying relaxed table strategies...")
             for settings in (
                 {
                     "vertical_strategy": "lines",
@@ -180,21 +181,25 @@ def detect_and_parse_pdf(file_bytes: bytes, password: str | None = None) -> Tupl
                 {"vertical_strategy": "text", "horizontal_strategy": "text"},
             ):
                 try:
+                    _stmt_log.info("detect_and_parse_pdf: Trying table settings: %s", settings)
                     all_data = _extract_all_tables(file_bytes, password, settings)
                 except Exception as ex:
-                    _stmt_log.warning("PDF: table extract with settings failed: %s", ex)
+                    _stmt_log.warning("detect_and_parse_pdf: Table extraction with settings failed: %s", ex)
                     all_data = []
                 if all_data:
+                    _stmt_log.info("detect_and_parse_pdf: Succeeded in table extraction with settings: %s", settings)
                     break
 
         if not all_data:
+            _stmt_log.info("detect_and_parse_pdf: Table extraction failed. Attempting full text extraction for regex fallback...")
             plain = _extract_full_text(file_bytes, password)
             if plain and len(plain.strip()) >= 15:
                 _stmt_log.info(
-                    "PDF: still no tables — using text fallback (%s chars)",
+                    "detect_and_parse_pdf: Text extracted (%s chars). Executing regex fallback line-by-line...",
                     len(plain),
                 )
                 return fallback_dataframe_from_statement_text(plain)
+            _stmt_log.warning("detect_and_parse_pdf: PDF text length is too short or empty. Parsing failed.")
             return None, (
                 "Could not read transactions from this PDF. "
                 "Try: (1) export from net banking as PDF with text, not a photo scan, "
@@ -202,6 +207,7 @@ def detect_and_parse_pdf(file_bytes: bytes, password: str | None = None) -> Tupl
             )
 
         df = pd.DataFrame(all_data)
+        _stmt_log.info("detect_and_parse_pdf: Initial DataFrame created from extracted tables. Shape: %s", df.shape)
         
         # Check if the table was heavily smashed (e.g. HDFC borderless tables)
         smashed = False
@@ -209,18 +215,22 @@ def detect_and_parse_pdf(file_bytes: bytes, password: str | None = None) -> Tupl
             max_newlines = df.astype(str).apply(lambda col: col.str.count("\n")).max().max()
             if max_newlines > 4:
                 smashed = True
-        except Exception:
+        except Exception as e:
+            _stmt_log.warning("detect_and_parse_pdf: Error checking smashed layout: %s", e)
             pass
 
         if len(df) < 2 or smashed:
+            _stmt_log.info("detect_and_parse_pdf: Table structure is smashed or contains too few rows (%s). Invoking text fallback...", len(df))
             plain = _extract_full_text(file_bytes, password)
             if plain and len(plain.strip()) >= 15:
-                _stmt_log.info(f"PDF: table {'smashed' if smashed else 'too small'} — text fallback")
+                _stmt_log.info("detect_and_parse_pdf: Text extraction successful. running regex fallback...")
                 return fallback_dataframe_from_statement_text(plain)
             if len(df) < 2:
+                _stmt_log.warning("detect_and_parse_pdf: PDF has insufficient table rows and text extraction failed.")
                 return None, "Parsed table had insufficient rows."
 
         if any("S.No" in str(row) for row in all_data[:10]):
+            _stmt_log.info("detect_and_parse_pdf: S.No column identifier found. Formatting for IDBI Bank statement...")
             header_idx = 0
             for i, row in enumerate(all_data):
                 if "S.No" in str(row):
@@ -237,25 +247,29 @@ def detect_and_parse_pdf(file_bytes: bytes, password: str | None = None) -> Tupl
                 "Cheque No": "Reference",
             }
             df.rename(columns=mapping, inplace=True)
+            _stmt_log.info("detect_and_parse_pdf: Mapped IDBI Bank columns: %s", list(df.columns))
             return df, "IDBI Bank Detected"
 
         try:
+            _stmt_log.info("detect_and_parse_pdf: Treating row 0 as header column names: %s", df.iloc[0].tolist())
             df.columns = df.iloc[0]
             df = df[1:]
         except Exception as ex:
-            _stmt_log.warning("PDF: could not interpret first row as header: %s", ex)
+            _stmt_log.warning("detect_and_parse_pdf: Could not interpret first row as header: %s. Reverting to text fallback.", ex)
             plain = _extract_full_text(file_bytes, password)
             if plain and len(plain.strip()) >= 15:
                 return fallback_dataframe_from_statement_text(plain)
             return None, "Could not interpret bank statement table headers."
 
         if len(df) < 1:
+            _stmt_log.warning("detect_and_parse_pdf: Table is empty after removing header row. Reverting to text fallback.")
             plain = _extract_full_text(file_bytes, password)
             if plain and len(plain.strip()) >= 15:
                 return fallback_dataframe_from_statement_text(plain)
             return None, "Statement table had no data rows."
 
         current_cols = [str(c).lower() for c in df.columns if c is not None]
+        _stmt_log.info("detect_and_parse_pdf: Header interpretation complete. Initial columns: %s", current_cols)
 
         def find_col(keywords):
             for i, col in enumerate(df.columns):
@@ -409,7 +423,7 @@ def _auto_detect_columns(df: pd.DataFrame) -> pd.DataFrame:
     # If name-based mapping created credits/debits/balance=0, auto-detect should still run.
     already_mapped: set[str] = {"trans_date", "remarks"} & set(df.columns)
     for col in ["credits", "debits", "balance"]:
-        if col in df.columns and df[col].sum() != 0:
+        if col in df.columns and _to_numeric_col(df[col]).fillna(0.0).sum() != 0:
             already_mapped.add(col)
 
     # Collect candidate numeric columns (skip already-mapped ones)
@@ -504,8 +518,8 @@ def _auto_detect_columns(df: pd.DataFrame) -> pd.DataFrame:
     # ── Fallback: single amount column → split by narration Dr/Cr ─────────────
     # If we still have credits=0 and debits=0 (or one is still missing),
     # and there's a single non-balance numeric column, try to split by narration.
-    credits_sum = float(df["credits"].sum()) if "credits" in df.columns else 0.0
-    debits_sum = float(df["debits"].sum()) if "debits" in df.columns else 0.0
+    credits_sum = float(_to_numeric_col(df["credits"]).fillna(0.0).sum()) if "credits" in df.columns else 0.0
+    debits_sum = float(_to_numeric_col(df["debits"]).fillna(0.0).sum()) if "debits" in df.columns else 0.0
 
     if credits_sum == 0 and debits_sum == 0 and balance_candidate is None:
         # Try splitting the largest numeric column by narration/remarks keywords
@@ -601,9 +615,9 @@ def clean_bank_statement(df: pd.DataFrame) -> pd.DataFrame:
     # This runs AFTER all name-based strategies. It uses statistical fingerprints
     # (zero-fraction, monotonicity, mean magnitude) to classify numeric columns
     # as balance / credits / debits regardless of what the bank named them.
-    credits_mapped = "credits" in df.columns and df["credits"].sum() != 0
-    debits_mapped = "debits" in df.columns and df["debits"].sum() != 0
-    balance_mapped = "balance" in df.columns and df["balance"].sum() != 0
+    credits_mapped = "credits" in df.columns and _to_numeric_col(df["credits"]).fillna(0.0).sum() != 0
+    debits_mapped = "debits" in df.columns and _to_numeric_col(df["debits"]).fillna(0.0).sum() != 0
+    balance_mapped = "balance" in df.columns and _to_numeric_col(df["balance"]).fillna(0.0).sum() != 0
     if not (credits_mapped and debits_mapped and balance_mapped):
         df = _auto_detect_columns(df)
     # ─────────────────────────────────────────────────────────────────────────────
@@ -625,7 +639,7 @@ def clean_bank_statement(df: pd.DataFrame) -> pd.DataFrame:
                 # Strip currency symbols and stray spaces — but NOT the decimal point!
                 .str.replace(r"[₹Rs\s]+", "", regex=True)
             )
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            df[col] = pd.to_numeric(cleaned, errors="coerce").fillna(0)
 
     if "trans_date" in df.columns:
         s = df["trans_date"]

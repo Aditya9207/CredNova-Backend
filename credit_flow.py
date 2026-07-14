@@ -5,7 +5,6 @@ Admin asset verification can update has_home / has_gold and trigger re-scoring.
 from __future__ import annotations
 
 import io
-import logging
 import os
 from pathlib import Path
 from datetime import datetime, timezone
@@ -31,14 +30,9 @@ from statement_service import (
     dataframe_to_csv_string,
     process_bank_pdf,
 )
+from system_logger import get_logger
 
-logger = logging.getLogger("crednova.credit_flow")
-if not logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("%(levelname)s [credit-flow] %(message)s"))
-    logger.addHandler(_h)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
+logger = get_logger("credit_flow")
 
 
 
@@ -238,7 +232,10 @@ def build_model_payload(form: CreditApplyForm, statement: dict[str, Any]) -> dic
 
 async def call_credit_model(payload: dict[str, Any]) -> dict[str, Any]:
     from ml_inference import run_inference
+
+    logger.info("Calling local ML model with payload keys=%s", list(payload.keys()))
     result = run_inference(payload)
+    logger.info("Local ML model returned credit_score=%s risk_level=%s", result.get("credit_score"), result.get("risk_level"))
     return result
 
 
@@ -251,12 +248,15 @@ async def _run_credit_apply(
     statement_df: Optional[pd.DataFrame] = None,
     csv_parse_message: str = "",
 ) -> dict[str, Any]:
+    logger.info("Initializing Credit Application Pipeline...")
     logger.info(
-        "Step 1/8: Start apply clerk_user_id=%s no_cibil=%s has_pdf=%s has_csv_df=%s",
+        "Step 1/8: Start apply clerk_user_id=%s no_cibil=%s has_pdf=%s has_csv_df=%s pdf_password_provided=%s has_pan_scan=%s",
         form.clerk_user_id or "(none)",
         form.no_cibil_score,
         bool(statement_pdf and getattr(statement_pdf, "filename", None)),
         statement_df is not None,
+        bool(pdf_password),
+        bool(pan_scan and getattr(pan_scan, "filename", None)),
     )
     statement_metrics: dict[str, Any] = {}
     parse_message = ""
@@ -265,29 +265,40 @@ async def _run_credit_apply(
     parsed_df: Any = None
 
     if statement_df is not None:
+        logger.info("Step 2/8: Processing pre-loaded CSV dataframe (rows=%s)", len(statement_df))
         cleaned = clean_bank_statement(statement_df.copy())
+        logger.info("Cleaned CSV bank statement. Categorizing dataframe...")
         final = categorize_dataframe(cleaned)
         parse_message = csv_parse_message or "CSV_UPLOAD_OK"
         transactions_csv = dataframe_to_csv_string(final)
         row_count = len(final)
         parsed_df = final
+        logger.info("Calculating statement metrics from finalized CSV...")
         statement_metrics = calculate_statement_metrics(final)
         logger.info(
-            "Step 2-3/8: Preloaded CSV/DataFrame rows=%s parse=%s monthly_upi=%s",
+            "Step 2-3/8: Preloaded CSV/DataFrame processing complete. rows=%s parse=%s monthly_upi=%s",
             row_count,
             parse_message,
             statement_metrics.get("monthly_upi"),
         )
     elif statement_pdf is not None and getattr(statement_pdf, "filename", None):
+        logger.info("Step 2/8: Reading uploaded PDF file: filename=%s", statement_pdf.filename)
         raw = await statement_pdf.read()
-        logger.info("Step 2/8: PDF uploaded size_bytes=%s", len(raw))
+        logger.info("PDF read complete. Size: %s bytes", len(raw))
         if len(raw) > 5 * 1024 * 1024:
+            logger.warning("Upload rejected: PDF size %s bytes exceeds maximum allowed (5MB)", len(raw))
             raise HTTPException(status_code=400, detail="PDF too large (max 5MB to prevent memory limits)")
+        
+        logger.info("Parsing bank statement PDF. Password provided: %s", bool(pdf_password))
         df, parse_message, statement_metrics = process_bank_pdf(raw, pdf_password or None)
         if df is None:
             if parse_message == "PASSWORD_REQUIRED":
+                logger.warning("PDF parsing failed: Password protected and invalid or missing password.")
                 raise HTTPException(status_code=400, detail="PDF is password protected; send pdf_password")
+            logger.warning("PDF parsing failed with error message: %s", parse_message)
             raise HTTPException(status_code=400, detail=parse_message)
+        
+        logger.info("Successfully extracted dataframe from PDF (rows=%s). Converting to CSV string...", len(df))
         transactions_csv = dataframe_to_csv_string(df)
         row_count = len(df)
         parsed_df = df
@@ -302,32 +313,42 @@ async def _run_credit_apply(
             "Step 3/8: PDF data extraction complete; ready to merge with form for local scoring payload"
         )
     else:
-        logger.info("Step 2-3/8: No bank PDF; using form/defaults for statement metrics")
+        logger.info("Step 2-3/8: No bank PDF or CSV uploaded; using default values or form values for statement metrics")
 
+    logger.info("Computing secondary statement analysis and monthly insights...")
     statement_analysis = compute_statement_analysis(parsed_df)
     logger.info(
-        "Step 3c/8: Statement analysis available=%s months=%s",
+        "Step 3c/8: Statement analysis available=%s months=%s. Insights list size=%s",
         statement_analysis.get("available"),
         len(statement_analysis.get("monthly") or []),
+        len(statement_analysis.get("insights") or []),
     )
 
     needs_physical = bool(form.request_physical_asset_verification) or (
         form.has_home == 1 or form.has_gold == 1
     )
+    logger.info("Physical asset verification required: %s (reason: form request=%s, home=%s, gold=%s)", 
+                needs_physical, form.request_physical_asset_verification, form.has_home, form.has_gold)
 
+    logger.info("Step 4/8: Building unified ML model payload...")
     payload = build_model_payload(form, statement_metrics)
     logger.info(
-        "Step 4/8: Local ML branch — statement-derived snapshot=%s; merged payload keys for remote /predict",
+        "Step 4/8: Local ML branch — statement-derived snapshot=%s; merged payload keys: %s",
         statement_branch_snapshot(statement_metrics),
+        list(payload.keys())
     )
     logger.info(
         "Step 4/8: Local processing — merged applicant form + statement metrics into model payload "
-        "(CIBIL_score=%s age=%s annual_income=%s upi_transactions_monthly=%s)",
+        "(CIBIL_score=%s age=%s annual_income=%s upi_transactions_monthly=%s cash_transaction_ratio=%s business_type=%s)",
         payload.get("CIBIL_score"),
         payload.get("age"),
         payload.get("annual_income"),
         payload.get("upi_transactions_monthly"),
+        payload.get("cash_transaction_ratio"),
+        form.business_type,
     )
+    
+    logger.info("Sending feature payload to local ML credit-scoring model...")
     model_out = await call_credit_model(payload)
     if isinstance(model_out, dict):
         logger.info(
@@ -338,6 +359,7 @@ async def _run_credit_apply(
     else:
         logger.info("Step 5b/8: Online ML model returned non-dict type=%s", type(model_out).__name__)
 
+    logger.info("Serializing application document for persistence in MongoDB...")
     doc = {
         "clerk_user_id": form.clerk_user_id,
         "applicant": {
@@ -371,6 +393,7 @@ async def _run_credit_apply(
         "bank_employee_csv": bool(statement_df is not None),
     }
 
+    logger.info("Connecting to MongoDB and executing insertion...")
     coll = _credit_collection()
     ins = coll.insert_one(doc)
     app_id = str(ins.inserted_id)
@@ -381,17 +404,24 @@ async def _run_credit_apply(
 
     # Optional PAN scan (image/PDF) — stored for admin review; max 8MB
     if pan_scan is not None and getattr(pan_scan, "filename", None):
+        logger.info("Step 7/8: Optional PAN scan file detected. Starting read: filename=%s", pan_scan.filename)
         pan_saved = False
         try:
             raw_pan = await pan_scan.read()
+            logger.info("PAN scan read complete. Size: %s bytes", len(raw_pan))
             if raw_pan and len(raw_pan) <= 8 * 1024 * 1024:
                 upload_dir = Path(__file__).resolve().parent / "uploads" / "pan"
+                logger.info("Ensuring target upload directory exists: %s", upload_dir)
                 upload_dir.mkdir(parents=True, exist_ok=True)
                 suffix = Path(pan_scan.filename or "scan").suffix or ".bin"
                 if suffix.lower() not in {".jpg", ".jpeg", ".png", ".pdf", ".webp", ".bin"}:
+                    logger.warning("Unsupported PAN scan file extension: %s. Using default suffix .bin", suffix)
                     suffix = ".bin"
                 out_path = upload_dir / f"{app_id}{suffix}"
+                logger.info("Writing PAN scan bytes to: %s", out_path)
                 out_path.write_bytes(raw_pan)
+                
+                logger.info("Updating MongoDB application record with PAN scan path...")
                 coll.update_one(
                     {"_id": ins.inserted_id},
                     {
@@ -404,15 +434,16 @@ async def _run_credit_apply(
                 pan_saved = True
             else:
                 logger.warning(
-                    "Step 7/8: PAN file missing or over 8MB; skipped application_id=%s",
+                    "Step 7/8: PAN file missing or size %s bytes exceeds maximum 8MB; skipped application_id=%s",
+                    len(raw_pan) if raw_pan else 0,
                     app_id,
                 )
         except Exception as e:
-            logger.warning("Step 7/8: PAN scan save failed application_id=%s err=%s", app_id, e)
+            logger.error("Step 7/8: PAN scan save failed application_id=%s err=%s", app_id, e)
         if pan_saved:
-            logger.info("Step 7/8: PAN scan saved application_id=%s", app_id)
+            logger.info("Step 7/8: PAN scan successfully saved application_id=%s", app_id)
     else:
-        logger.info("Step 7/8: No PAN scan upload")
+        logger.info("Step 7/8: No PAN scan upload detected")
 
     logger.info(
         "Step 8/8: Apply complete — returning JSON to client (frontend can store + show portfolio) application_id=%s",
@@ -520,6 +551,7 @@ async def bank_employee_analyze_csv(
 
 @router.get("/application/{application_id}")
 def get_application(application_id: str):
+    logger.info("GET /credit/application/%s", application_id)
     try:
         oid = ObjectId(application_id)
     except InvalidId:
@@ -530,6 +562,7 @@ def get_application(application_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
     doc["_id"] = str(doc["_id"])
+    logger.info("Application fetched application_id=%s status=%s", application_id, doc.get("status"))
     return doc
 
 
@@ -539,6 +572,7 @@ async def get_application_insights(application_id: str):
     Spending breakdown (keyword rules on statement CSV debits) + credit tips.
     Optional OpenAI ``gpt-4o-mini`` narrative when ``OPENAI_API_KEY`` is set.
     """
+    logger.info("GET /credit/application/%s/insights — building spending + credit tips", application_id)
     try:
         oid = ObjectId(application_id)
     except InvalidId:
@@ -555,6 +589,13 @@ async def get_application_insights(application_id: str):
     spending = aggregate_spending_from_csv(csv_text or "")
     llm_narrative, llm_tips, llm_used = await llm_spending_and_credit_advice(
         spending, model_output, form
+    )
+    logger.info(
+        "Insights ready application_id=%s categories=%s llm_used=%s tips=%s",
+        application_id,
+        len(spending.get("categories") or []),
+        llm_used,
+        len((llm_tips or []) + []),
     )
     return build_insights_response(
         csv_text if isinstance(csv_text, str) else None,
@@ -595,6 +636,12 @@ async def admin_update_assets(
     body: AssetVerificationBody,
     x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
 ):
+    logger.info(
+        "PATCH /credit/admin/application/%s/assets — has_home=%s has_gold=%s",
+        application_id,
+        body.has_home,
+        body.has_gold,
+    )
     _require_admin(x_admin_key)
 
     try:
@@ -618,6 +665,11 @@ async def admin_update_assets(
     statement_metrics = (doc.get("statement") or {}).get("metrics") or {}
     payload = build_model_payload(form, statement_metrics)
     model_out = await call_credit_model(payload)
+    logger.info(
+        "Asset verification rescored application_id=%s new_credit_score=%s",
+        application_id,
+        model_out.get("credit_score") if isinstance(model_out, dict) else None,
+    )
 
     coll.update_one(
         {"_id": oid},

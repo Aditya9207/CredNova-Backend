@@ -1,5 +1,5 @@
 # pyrefly: ignore [missing-import]
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
@@ -10,20 +10,44 @@ import pandas as pd
 from urllib.parse import unquote
 import subprocess
 import json
+import time
 
 from dotenv import load_dotenv
 load_dotenv()
 
+from system_logger import get_logger, log_path, setup_logging
+
+setup_logging()
+logger = get_logger("app")
+
 # Custom modules
 from inference_utils import pd_to_tier, aggregate_user_scores
 from credit_flow import router as credit_router
+from preprocess import preprocess_image, find_best_rotation
+from pan_extractor import extract_pan_fields
+from doctr.models import ocr_predictor
+import cv2
+from fastapi import UploadFile, File
+
+# Load OCR model once at startup
+ocr_model = ocr_predictor(
+    det_arch="db_mobilenet_v3_large",
+    reco_arch="crnn_mobilenet_v3_small",
+    pretrained=True,
+    assume_straight_pages=True
+).eval()
+
 
 # MongoDB connection
-client = pymongo.MongoClient(os.getenv("MONGO_URI"))
+_mongo_uri = os.getenv("MONGO_URI")
+logger.info("Connecting to MongoDB …")
+client = pymongo.MongoClient(_mongo_uri)
 db = client["crednova"]
 users_coll = db["users"]
+logger.info("MongoDB connected — database=crednova collection=users")
 
 def ollama_generate(prompt: str, model: str = "mistral"):
+    logger.info("Ollama generate — model=%s prompt_len=%s", model, len(prompt))
     try:
         result = subprocess.run(
             ["ollama", "run", model],
@@ -31,14 +55,19 @@ def ollama_generate(prompt: str, model: str = "mistral"):
             capture_output=True,
             check=True
         )
-        return result.stdout.decode("utf-8").strip()
+        out = result.stdout.decode("utf-8").strip()
+        logger.info("Ollama generate complete — response_len=%s", len(out))
+        return out
     except subprocess.CalledProcessError as e:
-        return f"Error: {e.stderr.decode('utf-8')}"
+        err = e.stderr.decode("utf-8")
+        logger.error("Ollama generate failed: %s", err)
+        return f"Error: {err}"
 
 
 # Load feature explanation KB //Retrerivel Layer
 with open("feature_explanations.json", encoding="utf-8") as f:
     feature_kb = json.load(f)
+logger.info("Feature explanation KB loaded — entries=%s", len(feature_kb))
 
 def retrieve_explanations(top_shap):
     explanations = []
@@ -91,14 +120,51 @@ app.add_middleware(
         "https://crednova-backend.onrender.com",
         *_extra_origins,
     ],
-    # Covers all *.vercel.app preview/branch URLs automatically
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    # Covers all *.vercel.app preview/branch URLs, localhost on any port, and LAN subnets
+    allow_origin_regex=r"https://.*\.vercel\.app|http://localhost(:\d+)?|http://127\.0\.0\.1(:\d+)?|http://192\.168\.\d+\.\d+(:\d+)?|http://10\.\d+\.\d+\.\d+(:\d+)?|http://172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.include_router(credit_router, prefix="/credit", tags=["credit"])
+
+
+@app.on_event("startup")
+def on_startup():
+    from ml_inference import model, scaler
+
+    logger.info("CredNova API starting — log_file=%s", log_path())
+    logger.info("ML model loaded=%s scaler loaded=%s", model is not None, scaler is not None)
+
+
+@app.middleware("http")
+async def log_http_requests(request: Request, call_next):
+    http_logger = get_logger("http")
+    start = time.perf_counter()
+    client_host = request.client.host if request.client else "unknown"
+    http_logger.info("→ %s %s client=%s", request.method, request.url.path, client_host)
+    try:
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start) * 1000
+        http_logger.info(
+            "← %s %s status=%s duration_ms=%.1f",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+        )
+        return response
+    except Exception as exc:
+        duration_ms = (time.perf_counter() - start) * 1000
+        http_logger.exception(
+            "← %s %s failed duration_ms=%.1f error=%s",
+            request.method,
+            request.url.path,
+            duration_ms,
+            exc,
+        )
+        raise
 
 # -------------------- MODELS --------------------
 class ProfileRequest(BaseModel):
@@ -217,6 +283,7 @@ def generate_remark(application_data):
 # Profile endpoints
 @app.post("/profile")
 def create_or_update_profile(req: ProfileRequest):
+    logger.info("POST /profile — clerk_user_id=%s name=%s", req.clerk_user_id, req.name)
     doc = {
         "clerk_user_id": req.clerk_user_id,
         "profile": {
@@ -229,10 +296,12 @@ def create_or_update_profile(req: ProfileRequest):
         "profile_updated_at": datetime.now(timezone.utc),
     }
     users_coll.update_one({"clerk_user_id": req.clerk_user_id}, {"$set": doc}, upsert=True)
+    logger.info("Profile saved — clerk_user_id=%s", req.clerk_user_id)
     return {"status": "stored", "clerk_user_id": req.clerk_user_id}
 
 @app.get("/profile")
 def get_profile(clerk_user_id: str):
+    logger.info("GET /profile — clerk_user_id=%s", clerk_user_id)
     proj = {"_id": 0, "profile": 1, "has_profile": 1, "clerk_user_id": 1}
     user = users_coll.find_one({"clerk_user_id": clerk_user_id}, proj)
     if user and user.get("profile"):
@@ -242,6 +311,12 @@ def get_profile(clerk_user_id: str):
 # Onboarding
 @app.post("/onboard")
 def onboard(req: OnboardRequest):
+    logger.info(
+        "POST /onboard — clerk_user_id=%s loan_amount=%s loan_category=%s",
+        req.clerk_user_id,
+        req.loan_amount_requested,
+        req.loan_category,
+    )
     if req.bill_on_time_ratio is None:
         req.bill_on_time_ratio = 0.0
     doc = {
@@ -251,12 +326,14 @@ def onboard(req: OnboardRequest):
         "status": "received"
     }
     inserted_id = users_coll.insert_one(doc).inserted_id
+    logger.info("Onboard stored — mongo_id=%s clerk_user_id=%s", inserted_id, req.clerk_user_id)
     return {"mongo_id": str(inserted_id), "clerk_user_id": req.clerk_user_id, "status": "stored"}
 
 # Psychometric endpoints
 
 @app.post("/save-psychometric")
 def save_psychometric_score(req: PsychometricScoreRequest):
+    logger.info("POST /save-psychometric — clerk_user_id=%s score=%s", req.clerk_user_id, req.psychometric_score)
     score = req.psychometric_score
     if score < 0 or score > 1:
         raise HTTPException(status_code=400, detail="Score must be between 0 and 1")
@@ -284,6 +361,7 @@ def psychometric_status(clerk_user_id: str):
 # User data endpoints
 @app.get("/users")
 def get_user_data(clerk_user_id: str):
+    logger.info("GET /users — clerk_user_id=%s (scoring applications)", clerk_user_id)
     apps_cursor = users_coll.find({"clerk_user_id": clerk_user_id}, {"_id": 0})
     applications = list(apps_cursor)
     if not applications:
@@ -305,7 +383,7 @@ def get_user_data(clerk_user_id: str):
 
         # Skip if any required field is missing
         if not REQUIRED_FIELDS.issubset(raw_data.keys()):
-            print(f"Skipping app due to missing fields: {raw_data}")
+            logger.warning("Skipping app — missing required fields clerk_user_id=%s", clerk_user_id)
             continue
 
         # Use new unified ML model (run_inference) — old BharatScore helpers removed
@@ -313,7 +391,7 @@ def get_user_data(clerk_user_id: str):
             from ml_inference import run_inference
             result = run_inference(raw_data)
         except Exception as e:
-            print(f"run_inference failed: {e}")
+            logger.error("run_inference failed clerk_user_id=%s: %s", clerk_user_id, e)
             result = {"error": str(e)}
 
         # Add extra metadata
@@ -326,6 +404,13 @@ def get_user_data(clerk_user_id: str):
         raise HTTPException(status_code=400, detail="No valid applications found for scoring")
 
     aggregated = aggregate_user_scores(loan_results)
+    logger.info(
+        "User scores aggregated — clerk_user_id=%s apps=%s final_cibil=%s tier=%s",
+        clerk_user_id,
+        aggregated["loan_count"],
+        aggregated["final_cibil_score"],
+        aggregated["final_tier"],
+    )
 
     return {
         "applications": loan_results,
@@ -432,6 +517,11 @@ def admin_application_detail(clerk_user_id: str):
 @app.patch("/admin/applications/{clerk_user_id}/{created_timestamp}")
 def update_application_status(clerk_user_id: str, created_timestamp: str, update_req: ApplicationUpdateRequest):
     """Update application status with flexible timestamp matching"""
+    logger.info(
+        "PATCH /admin/applications — clerk_user_id=%s status=%s",
+        clerk_user_id,
+        update_req.status,
+    )
     
     valid_status = {"approved", "rejected", "issue", "pending"}
     if update_req.status not in valid_status:
@@ -486,6 +576,11 @@ def update_application_status(clerk_user_id: str, created_timestamp: str, update
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Failed to update application")
 
+    logger.info(
+        "Application status updated — clerk_user_id=%s new_status=%s",
+        clerk_user_id,
+        update_req.status,
+    )
     return {
         "message": "Application updated successfully",
         "clerk_user_id": clerk_user_id,
@@ -498,6 +593,11 @@ def update_application_status(clerk_user_id: str, created_timestamp: str, update
 @app.post("/admin/generate-insight")
 async def generate_ai_insight(req: AIInsightRequest):
     """Generate natural language AI insights for admin review"""
+    logger.info(
+        "POST /admin/generate-insight — clerk_user_id=%s application_created=%s",
+        req.clerk_user_id,
+        req.application_created,
+    )
     
     # Find the specific application
     app = users_coll.find_one({
@@ -517,6 +617,7 @@ async def generate_ai_insight(req: AIInsightRequest):
         from ml_inference import run_inference
         model_result = run_inference(raw_data)
     except Exception as e:
+        logger.error("Model prediction failed for insight: %s", e)
         return {"error": f"Model prediction failed: {str(e)}"}
     
     # Create natural language insight
@@ -580,6 +681,7 @@ async def generate_ai_insight(req: AIInsightRequest):
             "model_output": model_result
         }}
     )
+    logger.info("AI insight generated — clerk_user_id=%s insight_len=%s", req.clerk_user_id, len(insight))
     
     return {
         "insight": insight,
@@ -705,7 +807,7 @@ def get_user_applications_with_notifications(clerk_user_id: str):
             "total_count": len(applications)
         }
     except Exception as e:
-        print(f"Error fetching applications: {e}")
+        logger.error("Error fetching applications clerk_user_id=%s: %s", clerk_user_id, e)
         return {"applications": [], "total_count": 0, "error": str(e)}
     
     
@@ -726,12 +828,15 @@ def get_user_applications_with_notifications(clerk_user_id: str):
 @app.post("/generate-remark")
 def generate_remark_endpoint(data: dict):
     from ml_inference import run_inference
+    logger.info("POST /generate-remark — running ML + Ollama remark")
     try:
         result = run_inference(data)
         remark = generate_remark(result)
         result["ai_remark"] = remark
+        logger.info("Remark generated — credit_score=%s remark_len=%s", result.get("credit_score"), len(remark))
         return result
     except Exception as e:
+        logger.exception("Generate remark failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -740,7 +845,46 @@ def generate_remark_endpoint(data: dict):
 @app.get("/health")
 def health_check():
     from ml_inference import model, scaler
-    return {"status": "healthy", "model_loaded": model is not None, "scaler_loaded": scaler is not None}
+    healthy = model is not None and scaler is not None
+    logger.debug("GET /health — model_loaded=%s scaler_loaded=%s", model is not None, scaler is not None)
+    return {"status": "healthy" if healthy else "degraded", "model_loaded": model is not None, "scaler_loaded": scaler is not None}
+
+@app.post("/api/extract-pan")
+async def extract_pan(file: UploadFile = File(...)):
+    logger.info("POST /api/extract-pan — starting OCR processing")
+    image_bytes = await file.read()
+
+    try:
+        processed = preprocess_image(image_bytes)
+    except ValueError as e:
+        logger.warning("OCR image preprocessing failed: %s", e)
+        return {"error": str(e)}
+
+    best_rotated, ocr_result, rotation_debug = find_best_rotation(processed, ocr_model)
+
+    full_text = ""
+    lines = []
+    for block in ocr_result.pages[0].blocks:
+        for line in block.lines:
+            line_text = " ".join(w.value for w in line.words)
+            lines.append(line_text)
+            full_text += line_text + "\n"
+
+    fields = extract_pan_fields(full_text, lines)
+    logger.info(
+        "OCR extraction complete — pan=%s dob=%s name=%s",
+        fields.get("pan_number"),
+        fields.get("dob"),
+        fields.get("name")
+    )
+    return {
+        "pan_number": fields.get("pan_number"),
+        "full_name": fields.get("name"),
+        "date_of_birth": fields.get("dob"),
+        "raw_text": full_text,
+        "debug_rotation": rotation_debug
+    }
+
 
 @app.get("/")
 def root():

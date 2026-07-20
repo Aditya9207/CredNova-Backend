@@ -860,30 +860,40 @@ async def extract_pan(file: UploadFile = File(...)):
         logger.warning("OCR image preprocessing failed: %s", e)
         return {"error": str(e)}
 
-    best_rotated, ocr_result, rotation_debug = find_best_rotation(processed, ocr_model)
+    try:
+        best_rotated, ocr_result, rotation_debug = find_best_rotation(processed, ocr_model)
 
-    full_text = ""
-    lines = []
-    for block in ocr_result.pages[0].blocks:
-        for line in block.lines:
-            line_text = " ".join(w.value for w in line.words)
-            lines.append(line_text)
-            full_text += line_text + "\n"
+        full_text = ""
+        lines = []
+        for block in ocr_result.pages[0].blocks:
+            for line in block.lines:
+                line_text = " ".join(w.value for w in line.words)
+                lines.append(line_text)
+                full_text += line_text + "\n"
 
-    fields = extract_pan_fields(full_text, lines)
-    logger.info(
-        "OCR extraction complete — pan=%s dob=%s name=%s",
-        fields.get("pan_number"),
-        fields.get("dob"),
-        fields.get("name")
-    )
-    return {
-        "pan_number": fields.get("pan_number"),
-        "full_name": fields.get("name"),
-        "date_of_birth": fields.get("dob"),
-        "raw_text": full_text,
-        "debug_rotation": rotation_debug
-    }
+        fields = extract_pan_fields(full_text, lines)
+        logger.info(
+            "OCR extraction complete — pan=%s dob=%s name=%s",
+            fields.get("pan_number"),
+            fields.get("dob"),
+            fields.get("name")
+        )
+        return {
+            "pan_number": fields.get("pan_number"),
+            "full_name": fields.get("name"),
+            "date_of_birth": fields.get("dob"),
+            "raw_text": full_text,
+            "debug_rotation": rotation_debug
+        }
+    except Exception as e:
+        logger.error("OCR execution error: %s", e)
+        return {
+            "pan_number": None,
+            "full_name": None,
+            "date_of_birth": None,
+            "error": f"OCR processing failed ({str(e)}). Please fill details manually.",
+            "raw_text": ""
+        }
 
 
 @app.get("/")

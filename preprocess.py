@@ -63,6 +63,10 @@ def auto_crop_card(image: np.ndarray) -> np.ndarray:
     if maxWidth < 100 or maxHeight < 100:
         return orig  # degenerate result — bail out to original
 
+    aspect_ratio = float(maxWidth) / float(maxHeight)
+    if aspect_ratio < 1.1 or aspect_ratio > 2.3:
+        return orig  # abnormal aspect ratio — bail out to original uncropped image
+
     dst = np.array([
         [0, 0],
         [maxWidth - 1, 0],
@@ -81,7 +85,7 @@ def auto_crop_card(image: np.ndarray) -> np.ndarray:
 
 
 def preprocess_image(image_bytes: bytes) -> np.ndarray:
-    """Resize, auto-crop/flatten the card, and lightly denoise a phone photo."""
+    """Resize, auto-crop/flatten the card, and optimize contrast for OCR."""
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -96,12 +100,17 @@ def preprocess_image(image_bytes: bytes) -> np.ndarray:
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
 
     # Try to auto-detect and flatten the card — fixes rotation + skew + crop
-    img = auto_crop_card(img)
+    cropped = auto_crop_card(img)
 
-    # Light denoise only — keep color, don't threshold/binarize
-    img = cv2.fastNlMeansDenoisingColored(img, None, 6, 6, 7, 21)
+    # Mild contrast enhancement (CLAHE) on L channel for sharper OCR text without heavy blur
+    lab = cv2.cvtColor(cropped, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
-    return img
+    return enhanced
 
 
 def find_best_rotation(image: np.ndarray, model) -> tuple[np.ndarray, any, str]:

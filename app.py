@@ -29,13 +29,26 @@ from doctr.models import ocr_predictor
 import cv2
 from fastapi import UploadFile, File
 
-# Load OCR model once at startup
-ocr_model = ocr_predictor(
-    det_arch="db_mobilenet_v3_large",
-    reco_arch="crnn_mobilenet_v3_small",
-    pretrained=True,
-    assume_straight_pages=True
-).eval()
+# Lazy-load OCR model on demand to enable instant API server startup
+_ocr_model_cache = None
+
+def get_ocr_model():
+    global _ocr_model_cache
+    if _ocr_model_cache is None:
+        try:
+            logger.info("Initializing docTR OCR neural network...")
+            from doctr.models import ocr_predictor
+            _ocr_model_cache = ocr_predictor(
+                det_arch="db_mobilenet_v3_large",
+                reco_arch="crnn_mobilenet_v3_small",
+                pretrained=True,
+                assume_straight_pages=True
+            ).eval()
+            logger.info("docTR OCR model initialized successfully")
+        except Exception as e:
+            logger.error("Failed to load docTR OCR model: %s", e)
+            _ocr_model_cache = False
+    return _ocr_model_cache if _ocr_model_cache is not False else None
 
 
 # MongoDB connection
@@ -114,6 +127,14 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:5175",
+        "http://localhost:5176",
+        "http://127.0.0.1:5176",
+        "http://localhost:5177",
+        "http://127.0.0.1:5177",
+        "http://localhost:5178",
+        "http://127.0.0.1:5178",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "https://cred-nova-frontend.vercel.app",
@@ -861,7 +882,16 @@ async def extract_pan(file: UploadFile = File(...)):
         return {"error": str(e)}
 
     try:
-        best_rotated, ocr_result, rotation_debug = find_best_rotation(processed, ocr_model)
+        model_instance = get_ocr_model()
+        if not model_instance:
+            return {
+                "pan_number": None,
+                "full_name": None,
+                "date_of_birth": None,
+                "error": "OCR engine not available. Please fill details manually.",
+                "raw_text": ""
+            }
+        best_rotated, ocr_result, rotation_debug = find_best_rotation(processed, model_instance)
 
         full_text = ""
         lines = []

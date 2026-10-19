@@ -25,7 +25,6 @@ from inference_utils import pd_to_tier, aggregate_user_scores
 from credit_flow import router as credit_router
 from preprocess import preprocess_image, find_best_rotation
 from pan_extractor import extract_pan_fields
-from doctr.models import ocr_predictor
 import cv2
 from fastapi import UploadFile, File
 
@@ -153,10 +152,7 @@ app.include_router(credit_router, prefix="/credit", tags=["credit"])
 
 @app.on_event("startup")
 def on_startup():
-    from ml_inference import model, scaler
-
-    logger.info("CredNova API starting — log_file=%s", log_path())
-    logger.info("ML model loaded=%s scaler loaded=%s", model is not None, scaler is not None)
+    logger.info("CredNova API starting — log_file=%s (ML artifacts configured for on-demand lazy load)", log_path())
 
 
 @app.middleware("http")

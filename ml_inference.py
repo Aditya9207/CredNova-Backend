@@ -6,22 +6,38 @@ from system_logger import get_logger
 
 logger = get_logger("ml")
 
-logger.info("Loading ML artifacts from artifacts/ …")
-try:
-    model = joblib.load("artifacts/unified_credit_model_updated_final.pkl")
-    scaler = joblib.load("artifacts/unified_credit_scaler_updated_final.pkl")
-    feature_columns = joblib.load("artifacts/unified_feature_columns_updated_final.pkl")
-    label_encoder = joblib.load("artifacts/unified_label_encoder_updated_final.pkl")
-    logger.info(
-        "ML artifacts loaded — features=%s model=%s scaler=%s encoder=%s",
-        len(feature_columns),
-        type(model).__name__,
-        type(scaler).__name__,
-        type(label_encoder).__name__,
-    )
-except Exception as exc:
-    logger.exception("Failed to load ML artifacts: %s", exc)
-    raise
+_model = None
+_scaler = None
+_feature_columns = None
+_label_encoder = None
+
+def load_artifacts():
+    global _model, _scaler, _feature_columns, _label_encoder
+    if _model is None:
+        logger.info("Loading ML artifacts on-demand from artifacts/ …")
+        try:
+            _model = joblib.load("artifacts/unified_credit_model_updated_final.pkl")
+            _scaler = joblib.load("artifacts/unified_credit_scaler_updated_final.pkl")
+            _feature_columns = joblib.load("artifacts/unified_feature_columns_updated_final.pkl")
+            _label_encoder = joblib.load("artifacts/unified_label_encoder_updated_final.pkl")
+            logger.info(
+                "ML artifacts loaded — features=%s model=%s scaler=%s encoder=%s",
+                len(_feature_columns),
+                type(_model).__name__,
+                type(_scaler).__name__,
+                type(_label_encoder).__name__,
+            )
+        except Exception as exc:
+            logger.exception("Failed to load ML artifacts: %s", exc)
+            raise
+    return _model, _scaler, _feature_columns, _label_encoder
+
+def __getattr__(name: str):
+    if name in ("model", "scaler", "feature_columns", "label_encoder"):
+        m, s, f, l = load_artifacts()
+        mapping = {"model": m, "scaler": s, "feature_columns": f, "label_encoder": l}
+        return mapping[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def run_inference(payload: dict) -> dict:
@@ -34,11 +50,12 @@ def run_inference(payload: dict) -> dict:
         payload.get("cash_transaction_ratio"),
     )
     try:
-        df = pd.DataFrame([payload])[feature_columns]
-        scaled = scaler.transform(df)
-        pred_encoded = model.predict(scaled)[0]
-        pred_proba = model.predict_proba(scaled)[0]
-        label = label_encoder.inverse_transform([pred_encoded])[0]
+        m, s, f, l = load_artifacts()
+        df = pd.DataFrame([payload])[f]
+        scaled = s.transform(df)
+        pred_encoded = m.predict(scaled)[0]
+        pred_proba = m.predict_proba(scaled)[0]
+        label = l.inverse_transform([pred_encoded])[0]
         confidence = float(np.max(pred_proba))
         approval_prob = float(pred_proba[1]) if len(pred_proba) > 1 else confidence
 

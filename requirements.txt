@@ -37,5 +37,5 @@ python-dotenv
 httpx
 pdfplumber
 xgboost
-python-doctr[torch]
+# python-doctr[torch] (Document OCR feature is in calibration; disabled to prevent 2.5GB CUDA installation and 512MB OOM)
 opencv-python-headless

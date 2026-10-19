@@ -477,7 +477,13 @@ async def credit_apply(
         logger.warning("Invalid apply JSON: %s", e)
         raise HTTPException(status_code=400, detail=f"Invalid JSON in `data`: {e}")
     logger.info("POST /credit/apply: form JSON validated, entering pipeline")
-    return await _run_credit_apply(form, statement_pdf, pdf_password, pan_scan)
+    try:
+        return await _run_credit_apply(form, statement_pdf, pdf_password, pan_scan)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("CRITICAL: /credit/apply pipeline failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Application pipeline error ({type(e).__name__}): {e}")
 
 
 @router.post("/apply-json")
